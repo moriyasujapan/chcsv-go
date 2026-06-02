@@ -56,13 +56,28 @@ func buildDSN(loginStr string) (string, error) {
 	return dsn, nil
 }
 
-// bindVarRe matches Oracle-style bind variables (:name) in SQL.
-var bindVarRe = regexp.MustCompile(`:[a-zA-Z_][a-zA-Z0-9_]*`)
+// bindVarRe matches Oracle-style bind variables: named (:name) and
+// positional/numeric (:1, :2, ...).
+var bindVarRe = regexp.MustCompile(`:([a-zA-Z_][a-zA-Z0-9_]*|[0-9]+)`)
+
+// isNumericName reports whether a bind name consists only of digits (:1, :2).
+func isNumericName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // extractBindVars returns unique bind variable names (without leading ':')
-// in order of first appearance, skipping occurrences inside block comments.
+// in order of first appearance, skipping occurrences inside string literals,
+// quoted identifiers, and comments.
 func extractBindVars(sqlStr string) []string {
-	stripped := stripBlockComments(sqlStr)
+	stripped := stripNonCode(sqlStr)
 	matches := bindVarRe.FindAllString(stripped, -1)
 	seen := make(map[string]bool)
 	var names []string
@@ -76,26 +91,73 @@ func extractBindVars(sqlStr string) []string {
 	return names
 }
 
-func stripBlockComments(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
+// stripNonCode blanks out regions that must not be scanned for bind variables:
+// single-quoted string literals (e.g. the ':MI'/':SS' in a 'HH24:MI:SS' date
+// mask), double-quoted identifiers, line comments (-- ...), and block comments
+// (/* ... */). Blanked bytes are replaced with spaces so byte offsets and the
+// surrounding SQL structure are preserved.
+func stripNonCode(s string) string {
+	out := []byte(s)
+	n := len(s)
+	blank := func(from, to int) {
+		for j := from; j < to && j < n; j++ {
+			if out[j] != '\n' {
+				out[j] = ' '
+			}
+		}
+	}
 	i := 0
-	for i < len(s) {
-		if i+1 < len(s) && s[i] == '/' && s[i+1] == '*' {
-			i += 2
-			for i+1 < len(s) {
-				if s[i] == '*' && s[i+1] == '/' {
-					i += 2
+	for i < n {
+		switch {
+		case s[i] == '\'': // single-quoted string literal ('' escapes a quote)
+			j := i + 1
+			for j < n {
+				if s[j] == '\'' {
+					if j+1 < n && s[j+1] == '\'' {
+						j += 2
+						continue
+					}
+					j++
 					break
 				}
-				i++
+				j++
 			}
-			continue
+			blank(i, j)
+			i = j
+		case s[i] == '"': // double-quoted identifier
+			j := i + 1
+			for j < n && s[j] != '"' {
+				j++
+			}
+			if j < n {
+				j++ // include closing quote
+			}
+			blank(i, j)
+			i = j
+		case i+1 < n && s[i] == '-' && s[i+1] == '-': // line comment
+			j := i + 2
+			for j < n && s[j] != '\n' {
+				j++
+			}
+			blank(i, j)
+			i = j
+		case i+1 < n && s[i] == '/' && s[i+1] == '*': // block comment
+			j := i + 2
+			for j+1 < n && !(s[j] == '*' && s[j+1] == '/') {
+				j++
+			}
+			if j+1 < n {
+				j += 2 // include closing */
+			} else {
+				j = n
+			}
+			blank(i, j)
+			i = j
+		default:
+			i++
 		}
-		b.WriteByte(s[i])
-		i++
 	}
-	return b.String()
+	return string(out)
 }
 
 // execQuery executes sqlStr against db, writes CSV rows to w, and returns
@@ -109,7 +171,13 @@ func execQuery(ctx context.Context, db *sql.DB, cfg *Config, sqlStr string, w *c
 		if i < len(cfg.BindValues) {
 			val = cfg.BindValues[i]
 		}
-		args = append(args, sql.Named(name, val))
+		// Numeric/positional binds (:1, :2) cannot be bound by name (godror
+		// requires names to start with a letter), so pass them positionally.
+		if isNumericName(name) {
+			args = append(args, val)
+		} else {
+			args = append(args, sql.Named(name, val))
+		}
 	}
 	// godror.FetchRowCount sets the Oracle array fetch size, equivalent to
 	// "EXEC SQL FOR :FETCH_ARRAY FETCH" in the original Pro*C code.

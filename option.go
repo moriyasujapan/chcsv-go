@@ -27,7 +27,7 @@ func parseOptions(args []string) *Config {
 	cfg := &Config{
 		Terminate:  ',',
 		LongSize:   1000,
-		FetchArray: 100,
+		FetchArray: 10000,
 		OutRecords: 100,
 	}
 
